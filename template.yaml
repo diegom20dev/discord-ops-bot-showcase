@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Discord Ops Bot - Serverless architecture'
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: provided.al2
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        CAPTURES_TABLE: !Ref CapturesTable
+        TASKS_QUEUE_URL: !Ref TasksQueue
+
+Parameters:
+  DiscordPublicKey:
+    Type: String
+    Description: Discord application public key for signature verification
+  DiscordBotToken:
+    Type: String
+    NoEcho: true
+    Description: Discord bot token for API interactions
+  ClaudeAPIKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: (Optional) Anthropic Claude API key for summarization. If not provided, captures won't be summarized.
+
+Resources:
+  # DynamoDB Table for captures
+  CapturesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: discord-ops-captures
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-created_at-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # S3 Bucket for exports
+  ExportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'discord-ops-exports-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  # S3 Bucket Policy to allow public read access
+  ExportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ExportsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${ExportsBucket}/*'
+
+  # DynamoDB Table for exports
+  ExportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: discord-ops-exports
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # DynamoDB Table for reminders
+  RemindersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: discord-ops-reminders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: scheduled_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-scheduled_at-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: scheduled_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+
+  # SQS Queue for failed tasks (DLQ)
+  TasksQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: discord-ops-tasks-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # SQS Queue for async tasks
+  TasksQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: discord-ops-tasks
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TasksQueueDLQ.Arn
+        maxReceiveCount: 3  # Move to DLQ after 3 failed receives
+
+  # Lambda for Discord interactions (API Gateway)
+  InteractionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: discord-ops-interaction
+      CodeUri: cmd/interaction
+      Handler: bootstrap
+      Environment:
+        Variables:
+          DISCORD_PUBLIC_KEY: !Ref DiscordPublicKey
+          REMINDERS_TABLE: !Ref RemindersTable
+          EXPORTS_TABLE: !Ref ExportsTable
+          EXPORTS_BUCKET: !Ref ExportsBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CapturesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RemindersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExportsTable
+        - S3CrudPolicy:
+            BucketName: !Ref ExportsBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt TasksQueue.QueueName
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DiscordApiGateway
+            Path: /interactions
+            Method: POST
+
+  # Lambda for processing async tasks (SQS)
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: discord-ops-worker
+      CodeUri: cmd/worker
+      Handler: bootstrap
+      Environment:
+        Variables:
+          DISCORD_BOT_TOKEN: !Ref DiscordBotToken
+          CLAUDE_API_KEY: !Ref ClaudeAPIKey
+          EXPORTS_TABLE: !Ref ExportsTable
+          EXPORTS_BUCKET: !Ref ExportsBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CapturesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExportsTable
+        - S3CrudPolicy:
+            BucketName: !Ref ExportsBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt TasksQueue.QueueName
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TasksQueue.Arn
+            BatchSize: 10
+
+  # API Gateway for Discord interactions
+  DiscordApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: discord-ops-api
+      StageName: Prod
+      TracingEnabled: true
+
+  # Lambda for scheduled triage (EventBridge)
+  SchedulerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: discord-ops-scheduler
+      CodeUri: cmd/scheduler
+      Handler: bootstrap
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CapturesTable
+      Events:
+        DailyTriage:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 9 * * ? *)  # 9 AM UTC daily
+            Name: discord-ops-daily-triage
+
+Outputs:
+  InteractionEndpoint:
+    Description: Discord interaction endpoint URL
+    Value: !Sub 'https://${DiscordApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod/interactions/'
+  CapturesTableName:
+    Description: DynamoDB captures table
+    Value: !Ref CapturesTable
+  TasksQueueUrl:
+    Description: SQS tasks queue URL
+    Value: !Ref TasksQueue
+  TasksQueueDLQUrl:
+    Description: SQS tasks DLQ URL (failed messages)
+    Value: !Ref TasksQueueDLQ
+  RemindersTableName:
+    Description: DynamoDB reminders table
+    Value: !Ref RemindersTable
+  ExportsTableName:
+    Description: DynamoDB exports table
+    Value: !Ref ExportsTable
+  ExportsBucketName:
+    Description: S3 bucket for exports
+    Value: !Ref ExportsBucket

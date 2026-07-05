@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "discord-ops-bot"
+resolve_s3 = true
+s3_prefix = "discord-ops-bot"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "DiscordPublicKey=\"4ae47b7e3f1e2ee3455ffd645fdf255e813ce53f5f6bf52f621442d54613e407\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

@@ -1,0 +1,23 @@
+# Build artifacts
+cmd/*/bootstrap
+*.zip
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.iml
+
+# Environment
+.env
+.env.local
+
+# AWS SAM
+.aws-sam/
+build/
+dist/
+
+# Go
+*.mod.bak
+*.sum.bak
