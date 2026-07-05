@@ -52,8 +52,7 @@ func (m *mockQueue) EnqueueTask(ctx context.Context, task *domain.Task) error {
 // Tests
 func TestCreateCapture(t *testing.T) {
 	repo := &mockRepository{}
-	queue := &mockQueue{}
-	uc := NewCreateCaptureUC(repo, queue)
+	uc := NewCreateCaptureUC(repo)
 
 	ctx := context.Background()
 	capture, err := uc.Execute(ctx, CreateCaptureInput{
@@ -79,13 +78,5 @@ func TestCreateCapture(t *testing.T) {
 
 	if len(repo.saved) != 1 {
 		t.Errorf("Expected 1 saved capture, got %d", len(repo.saved))
-	}
-
-	if len(queue.tasks) != 1 {
-		t.Errorf("Expected 1 queued task, got %d", len(queue.tasks))
-	}
-
-	if queue.tasks[0].Type != "summarize" {
-		t.Errorf("Expected task type=summarize, got %s", queue.tasks[0].Type)
 	}
 }
